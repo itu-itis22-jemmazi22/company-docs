@@ -508,7 +508,7 @@ if tab_upload is not None:
                     editor=editor, summary=summary, author=author, isbn=isbn, year=year,
                     cover_path=cover_path, categories=categories
                 )
-                st.success("Document HTML enregistré ✅")
+                st.success("Document HTML enregistré ")
 
         elif kind == MODE_PDF:
             with st.form("form_pdf", clear_on_submit=True):

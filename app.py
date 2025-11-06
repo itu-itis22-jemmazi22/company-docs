@@ -1,37 +1,53 @@
-import io, os, uuid
+import io, os, uuid, re
 from datetime import datetime
 from typing import Optional
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 from sqlalchemy import create_engine, text
 from bs4 import BeautifulSoup
 from pdfminer.high_level import extract_text
-
-# Supabase client
 from supabase import create_client, Client
 
-# ---- Setup ----
+# ---- Page ----
 st.set_page_config(page_title="Company Docs", layout="wide")
 st.title("📚 Company Docs — Search & Upload (Supabase)")
 
+# ---- Secrets / Setup ----
 SB_URL  = st.secrets["SUPABASE_URL"]
-SB_ANON = st.secrets["SUPABASE_ANON_KEY"]              # for read
-SB_SVC  = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]      # for upload (keep secret)
+SB_ANON = st.secrets["SUPABASE_ANON_KEY"]              # for read (not used directly here)
+SB_SVC  = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]      # for server-side upload
 DB_URL  = st.secrets["DATABASE_URL"]
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
-sb: Client = create_client(SB_URL, SB_SVC)  # use service key so we can upload server-side
-BUCKET = "docs"
+sb: Client = create_client(SB_URL, SB_SVC)
+
+# Storage buckets
+BUCKET_PDF   = os.getenv("BUCKET_PDF", "docs")
+BUCKET_COVER = os.getenv("BUCKET_COVER", "covers")
+
+# ---- Session state ----
 if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
+
+# Load-more state (advanced search)
+POSTS_STEP_CARDS = 30
+POSTS_STEP_TABLE = 200
+if "adv_cards_shown" not in st.session_state:
+    st.session_state.adv_cards_shown = POSTS_STEP_CARDS
+if "adv_table_shown" not in st.session_state:
+    st.session_state.adv_table_shown = POSTS_STEP_TABLE
+if "adv_last_sig" not in st.session_state:
+    st.session_state.adv_last_sig = ""
+
+# ---- Small utils ----
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 def require_admin():
     if not st.session_state["is_admin"]:
         st.info("⬆️ L’upload est réservé aux administrateurs. Ouvrez l’onglet **Admin** pour vous connecter.")
         st.stop()
 
-# ---- Helpers ----
 def normalize_url(u: str | None) -> str | None:
     if not u: return None
     u = u.strip()
@@ -39,8 +55,6 @@ def normalize_url(u: str | None) -> str | None:
     if not u.startswith(("http://", "https://")):
         return "https://" + u
     return u
-
-from bs4 import BeautifulSoup
 
 def extract_title_from_html(html: str) -> str | None:
     soup = BeautifulSoup(html or "", "html.parser")
@@ -51,9 +65,6 @@ def extract_title_from_html(html: str) -> str | None:
     if h1 and h1.text.strip():
         return h1.text.strip()
     return None
-
-import re
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
 def guess_year_from_text(txt: str) -> int | None:
     if not txt: return None
@@ -69,7 +80,8 @@ def upsert_categories(names: list[str]) -> list[int]:
     with engine.begin() as con:
         for raw in names:
             name = raw.strip()
-            if not name: continue
+            if not name: 
+                continue
             slug = slugify(name)
             row = con.execute(text("""
                 insert into categories(name, slug) values (:n, :s)
@@ -87,7 +99,6 @@ def link_post_categories(post_id: int, cat_ids: list[int]) -> None:
                 values (:p, :c) on conflict do nothing
             """), {"p": post_id, "c": cid})
 
-
 def clean_html_to_text(html: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     for t in soup(["script","style","noscript","svg","nav","header","footer"]):
@@ -95,6 +106,33 @@ def clean_html_to_text(html: str) -> str:
     lines = [ln.strip() for ln in soup.get_text("\n", strip=True).splitlines()]
     return "\n".join([ln for ln in lines if ln])
 
+# ---- Storage helpers ----
+def upload_pdf_to_storage(pdf_bytes: bytes, suggested_name: str, published_at: Optional[datetime]) -> str:
+    year = (published_at.year if published_at else datetime.utcnow().year)
+    month = (published_at.month if published_at else datetime.utcnow().month)
+    unique = uuid.uuid4().hex[:8]
+    safe = suggested_name.replace(" ", "_").replace("/", "-")
+    path = f"pdf/{year:04d}/{month:02d}/{unique}_{safe}"
+    sb.storage.from_(BUCKET_PDF).upload(path, pdf_bytes, {"content-type": "application/pdf", "x-upsert": "true"})
+    return path
+
+def upload_cover_to_storage(img_bytes: bytes, suggested_name: str, published_at: Optional[datetime]) -> str:
+    year = (published_at.year if published_at else datetime.utcnow().year)
+    month = (published_at.month if published_at else datetime.utcnow().month)
+    unique = uuid.uuid4().hex[:8]
+    safe = suggested_name.replace(" ", "_").replace("/", "-")
+    path = f"covers/{year:04d}/{month:02d}/{unique}_{safe}"
+    sb.storage.from_(BUCKET_COVER).upload(path, img_bytes, {"content-type": "image/jpeg", "x-upsert": "true"})
+    return path
+
+def signed_url(bucket: str, storage_path: str, expire_sec: int = 3600) -> Optional[str]:
+    try:
+        res = sb.storage.from_(bucket).create_signed_url(storage_path, expire_sec)
+        return res.get("signedURL") or res.get("signedUrl")
+    except Exception:
+        return None
+
+# ---- DB helpers ----
 def insert_row(title: str, doc_type: str, published_at, source_url,
                raw_html, text_content, storage_path,
                editor, summary, author, isbn, year,
@@ -129,108 +167,6 @@ def insert_row(title: str, doc_type: str, published_at, source_url,
         link_post_categories(post_id, cat_ids)
     return post_id
 
-
-
-def search_docs(q: str, year_from: int, year_to: int, doc_types: list[str], limit: int = 200) -> pd.DataFrame:
-    base = """
-    select id, title, doc_type,
-           coalesce(published_at::date, created_at::date) as date,
-           source_url, storage_path
-    from posts
-    where doc_type = any(:types)
-      and (published_at is null or (published_at::date between :d1 and :d2))
-    """
-    params = {
-        "types": doc_types if doc_types else ["html", "pdf"],
-        "d1": f"{year_from}-01-01",
-        "d2": f"{year_to}-12-31"
-    }
-    if q.strip():
-        base += " and text_tsv @@ plainto_tsquery('simple', :q)"
-        params["q"] = q
-    base += " order by coalesce(published_at, created_at) desc nulls last, id desc limit :lim"
-    params["lim"] = limit
-    with engine.begin() as con:
-        return pd.read_sql(text(base), con, params=params)
-
-def fetch_post(post_id: int) -> Optional[pd.Series]:
-    with engine.begin() as con:
-        df = pd.read_sql(text("select * from posts where id=:i"), con, params={"i": post_id})
-    return df.iloc[0] if not df.empty else None
-
-def upload_pdf_to_storage(pdf_bytes: bytes, suggested_name: str, published_at: Optional[datetime]) -> str:
-    # path example: pdf/2025/09/UUID_name.pdf
-    year = (published_at.year if published_at else datetime.utcnow().year)
-    month = (published_at.month if published_at else datetime.utcnow().month)
-    unique = uuid.uuid4().hex[:8]
-    safe = suggested_name.replace(" ", "_").replace("/", "-")
-    path = f"pdf/{year:04d}/{month:02d}/{unique}_{safe}"
-    # upload
-    sb.storage.from_(BUCKET).upload(path, pdf_bytes, {"content-type": "application/pdf", "x-upsert": "true"})
-    return path
-
-def upload_cover_to_storage(img_bytes: bytes, suggested_name: str, published_at: Optional[datetime]) -> str:
-    year = (published_at.year if published_at else datetime.utcnow().year)
-    month = (published_at.month if published_at else datetime.utcnow().month)
-    unique = uuid.uuid4().hex[:8]
-    safe = suggested_name.replace(" ", "_").replace("/", "-")
-    path = f"covers/{year:04d}/{month:02d}/{unique}_{safe}"
-    sb.storage.from_("covers").upload(path, img_bytes, {"content-type": "image/jpeg", "x-upsert": "true"})
-    return path
-
-def signed_download_url(storage_path: str, expire_sec: int = 3600) -> Optional[str]:
-    try:
-        res = sb.storage.from_(BUCKET).create_signed_url(storage_path, expire_sec)
-        return res.get("signedURL") or res.get("signedUrl")
-    except Exception:
-        return None
-
-def search_docs_advanced(title_q: str, keyword_q: str, year: int | None,
-                         doc_types: list[str], cats: list[str], limit: int = 200) -> pd.DataFrame:
-    base = """
-    select p.id, p.title, p.doc_type,
-           coalesce(p.published_at::date, p.created_at::date) as date,
-           p.year, p.editor, p.author, p.isbn, p.summary,
-           p.source_url, p.storage_path, p.cover_path,
-           coalesce(string_agg(c.name, ', ' order by c.name), '') as categories
-    from posts p
-    left join post_categories pc on pc.post_id = p.id
-    left join categories c on c.id = pc.category_id
-    where p.doc_type = any(:types)
-    """
-    params = {"types": doc_types if doc_types else ["html","pdf"], "lim": limit}
-
-    if year:
-        base += " and p.year = :yr"
-        params["yr"] = int(year)
-
-    if title_q.strip():
-        base += " and unaccent(lower(p.title)) like unaccent(lower(:tq))"
-        params["tq"] = f"%{title_q.strip()}%"
-
-    if keyword_q.strip():
-        base += " and p.text_tsv @@ plainto_tsquery('simple', :kq)"
-        params["kq"] = keyword_q.strip()
-
-    if cats:
-        base += " and exists (select 1 from post_categories pc2 join categories c2 on c2.id=pc2.category_id where pc2.post_id=p.id and c2.name = any(:cats))"
-        params["cats"] = cats
-
-    base += " group by p.id "
-
-    if title_q.strip():
-        base += " order by similarity(unaccent(lower(p.title)), unaccent(lower(:tq2))) desc nulls last, p.id desc"
-        params["tq2"] = title_q.strip()
-    else:
-        base += " order by coalesce(p.published_at, p.created_at) desc nulls last, p.id desc"
-
-    base += " limit :lim"
-
-    with engine.begin() as con:
-        return pd.read_sql(text(base), con, params=params)
-
-
-
 def delete_document(doc_id: int) -> bool:
     with engine.begin() as con:
         row = con.execute(text("select storage_path, cover_path from posts where id=:i"),
@@ -238,125 +174,114 @@ def delete_document(doc_id: int) -> bool:
         if not row:
             return False
         storage_path, cover_path = row
-
-        # delete DB row
         con.execute(text("delete from posts where id=:i"), {"i": doc_id})
 
-    # delete files from storage (best-effort; ignore errors)
+    # best-effort: delete storage files
     try:
         if storage_path:
-            sb.storage.from_("docs").remove([storage_path])
+            sb.storage.from_(BUCKET_PDF).remove([storage_path])
     except Exception:
         pass
     try:
         if cover_path:
-            sb.storage.from_("covers").remove([cover_path])
+            sb.storage.from_(BUCKET_COVER).remove([cover_path])
     except Exception:
         pass
-
     return True
-def normalize_url(u: str | None) -> str | None:
-    if not u: return None
-    u = u.strip()
-    if not u: return None
-    if not u.startswith(("http://", "https://")):
-        return "https://" + u
-    return u
-import re
-def slugify(name: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip().lower()).strip("-")
-    return s or "cat"
 
-def upsert_categories(names: list[str]) -> list[int]:
-    ids = []
-    with engine.begin() as con:
-        for raw in names:
-            name = raw.strip()
-            if not name: continue
-            slug = slugify(name)
-            row = con.execute(text("""
-                insert into categories(name, slug) values (:n, :s)
-                on conflict (name) do update set name=excluded.name
-                returning id
-            """), {"n": name, "s": slug}).fetchone()
-            ids.append(int(row[0]))
-    return ids
-
-def link_post_categories(post_id: int, cat_ids: list[int]) -> None:
-    with engine.begin() as con:
-        for cid in cat_ids:
-            con.execute(text("""
-                insert into post_categories(post_id, category_id)
-                values (:p, :c) on conflict do nothing
-            """), {"p": post_id, "c": cid})
-def search_docs_advanced(title_q: str, keyword_q: str, year: int | None,
-                         doc_types: list[str], cats: list[str], limit: int = 200) -> pd.DataFrame:
-    base = """
-    select p.id, p.title, p.doc_type,
-           coalesce(p.published_at::date, p.created_at::date) as date,
-           p.year, p.editor, p.author, p.isbn, p.summary,
-           p.source_url, p.storage_path,
-           coalesce(string_agg(c.name, ', ' order by c.name), '') as categories
-    from posts p
-    left join post_categories pc on pc.post_id = p.id
-    left join categories c on c.id = pc.category_id
-    where p.doc_type = any(:types)
-    """
-    params = {"types": doc_types if doc_types else ["html","pdf"], "lim": limit}
+# ---- Advanced search (with Load more) ----
+def build_advanced_where(title_q: str, keyword_q: str, year: int | None,
+                         doc_types: list[str], cats: list[str]):
+    where = ["p.doc_type = any(:types)"]
+    params = {"types": doc_types if doc_types else ["html", "pdf"]}
 
     if year:
-        base += " and p.year = :yr"
+        where.append("p.year = :yr")
         params["yr"] = int(year)
 
     if title_q.strip():
-        base += " and unaccent(lower(p.title)) like unaccent(lower(:tq))"
+        where.append("unaccent(lower(p.title)) like unaccent(lower(:tq))")
         params["tq"] = f"%{title_q.strip()}%"
 
     if keyword_q.strip():
-        base += " and p.text_tsv @@ plainto_tsquery('simple', :kq)"
+        where.append("p.text_tsv @@ plainto_tsquery('simple', :kq)")
         params["kq"] = keyword_q.strip()
 
     if cats:
-        # match any of the selected categories
-        base += " and exists (select 1 from post_categories pc2 join categories c2 on c2.id=pc2.category_id where pc2.post_id=p.id and c2.name = any(:cats))"
+        where.append("""
+            exists (
+              select 1 from post_categories pc2
+              join categories c2 on c2.id = pc2.category_id
+              where pc2.post_id = p.id and c2.name = any(:cats)
+            )
+        """)
         params["cats"] = cats
 
-    base += """
-    group by p.id
+    return " and ".join(where), params
+
+def count_posts_advanced(title_q: str, keyword_q: str, year: int | None,
+                         doc_types: list[str], cats: list[str]) -> int:
+    where_sql, params = build_advanced_where(title_q, keyword_q, year, doc_types, cats)
+    sql = f"""
+        select count(distinct p.id)
+        from posts p
+        left join post_categories pc on pc.post_id = p.id
+        left join categories c on c.id = pc.category_id
+        where {where_sql}
     """
-
-    if title_q.strip():
-        base += " order by similarity(unaccent(lower(p.title)), unaccent(lower(:tq2))) desc nulls last, p.id desc"
-        params["tq2"] = title_q.strip()
-    else:
-        base += " order by coalesce(p.published_at, p.created_at) desc nulls last, p.id desc"
-
-    base += " limit :lim"
-
     with engine.begin() as con:
-        return pd.read_sql(text(base), con, params=params)
+        return int(con.execute(text(sql), params).scalar() or 0)
 
+def fetch_posts_page(title_q: str, keyword_q: str, year: int | None,
+                     doc_types: list[str], cats: list[str],
+                     limit: int, offset: int) -> pd.DataFrame:
+    where_sql, params = build_advanced_where(title_q, keyword_q, year, doc_types, cats)
+    order_sql = (
+        " order by similarity(unaccent(lower(p.title)), unaccent(lower(:tq2))) desc nulls last, p.id desc"
+        if title_q.strip()
+        else " order by coalesce(p.published_at, p.created_at) desc nulls last, p.id desc"
+    )
+    if title_q.strip():
+        params["tq2"] = title_q.strip()
 
-# ---- UI ----
-# Initialize admin state once
-if "is_admin" not in st.session_state:
-    st.session_state["is_admin"] = False
+    sql = f"""
+        select p.id, p.title, p.doc_type,
+               coalesce(p.published_at::date, p.created_at::date) as date,
+               p.year, p.editor, p.author, p.isbn, p.summary,
+               p.source_url, p.storage_path, p.cover_path,
+               coalesce(string_agg(c.name, ', ' order by c.name), '') as categories
+        from posts p
+        left join post_categories pc on pc.post_id = p.id
+        left join categories c on c.id = pc.category_id
+        where {where_sql}
+        group by p.id
+        {order_sql}
+        limit :lim offset :off
+    """
+    params["lim"] = int(limit)
+    params["off"] = int(offset)
+    with engine.begin() as con:
+        return pd.read_sql(text(sql), con, params=params)
 
-# Create tabs depending on admin state
+# ---- Tabs ----
 if st.session_state["is_admin"]:
     tab_search, tab_upload, tab_admin = st.tabs(["🔎 Search", "⬆️ Upload", "🔐 Admin"])
 else:
     tab_search, tab_admin = st.tabs(["🔎 Search", "🔐 Admin"])
     tab_upload = None
 
+# ===========================
+# 🔎 SEARCH TAB (Advanced)
+# ===========================
 with tab_search:
-    st.markdown("### Recherche")
-    # total count
-    with engine.begin() as con:
-        total = con.execute(text("select count(*) from posts")).scalar()
-    st.caption(f"Total documents : **{total}**")
+    st.markdown("### Recherche avancée")
 
-    # category options
+    # global total
+    with engine.begin() as con:
+        total_all = con.execute(text("select count(*) from posts")).scalar()
+    st.caption(f"Total documents (tous types) : **{total_all}**")
+
+    # categories list
     with engine.begin() as con:
         all_cats = [r[0] for r in con.execute(text("select name from categories order by name")).fetchall()]
 
@@ -376,80 +301,105 @@ with tab_search:
 
     view_mode = st.radio("Affichage", ["Cartes", "Table"], horizontal=True)
 
-    if st.button("Rechercher", type="primary") or (not title_q and not keyword_q and not year and not cats):
-        df = search_docs_advanced(title_q, keyword_q, year, doc_types, cats, limit=500)
-        st.write(f"Résultats : {len(df)}")
+    # reset counters if filters changed
+    sig = f"{title_q}|{keyword_q}|{year}|{','.join(sorted(doc_types))}|{','.join(sorted(cats))}|{view_mode}"
+    if sig != st.session_state.adv_last_sig:
+        st.session_state.adv_last_sig = sig
+        st.session_state.adv_cards_shown = POSTS_STEP_CARDS
+        st.session_state.adv_table_shown = POSTS_STEP_TABLE
 
-        def dl_link(row):
-            if row["doc_type"] == "pdf" and row["storage_path"]:
-                u = signed_download_url(row["storage_path"])
-                return f"[Télécharger]({u})" if u else ""
-            return ""
+    with st.spinner("Calcul du total…"):
+        total = count_posts_advanced(title_q, keyword_q, year, doc_types, cats)
 
-        def src_link(row):
-            u = normalize_url(row["source_url"])
-            return f"[Source]({u})" if u else ""
+    if total == 0:
+        st.info("Aucun résultat.")
+        st.stop()
 
-        if view_mode == "Table":
-            if not df.empty:
-                df["télécharger"] = df.apply(dl_link, axis=1)
-                df["source"] = df.apply(src_link, axis=1)
-                st.dataframe(df[["id","title","year","editor","author","isbn","categories","source","télécharger","date","doc_type"]],
-                             use_container_width=True, height=420)
-        else:
-            # Cartes en grille (comme l’exemple)
-            if df.empty:
-                st.info("Aucun résultat.")
-            else:
-                cards_per_row = 3
-                rows = (len(df) + cards_per_row - 1) // cards_per_row
-                idx = 0
-                for _ in range(rows):
-                    cols = st.columns(cards_per_row, gap="large")
-                    for c in cols:
-                        if idx >= len(df): 
-                            break
-                        row = df.iloc[idx]
-                        idx += 1
-                        with c:
-                            # image de couverture si dispo
-                            if row.get("cover_path"):
-                                cu = signed_download_url(row["cover_path"])
-                                if cu: st.image(cu, use_container_width=True)
-                            st.markdown(f"**{row['title']}**")
-                            meta = []
-                            if row.get("year"): meta.append(str(row["year"]))
-                            if row.get("editor"): meta.append(row["editor"])
-                            if row.get("author"): meta.append(row["author"])
-                            if row.get("isbn"): meta.append(f"ISBN: {row['isbn']}")
-                            if meta: st.caption(" • ".join(meta))
-                            if row.get("summary"):
-                                st.write((row["summary"][:220] + "…") if len(row["summary"])>220 else row["summary"])
-                            # actions
-                            links = []
-                            sl = src_link(row)
-                            if sl: links.append(sl)
-                            dl = dl_link(row)
-                            if dl: links.append(dl)
-                            if links:
-                                st.markdown(" | ".join(links))
+    def dl_link(row):
+        if row["doc_type"] == "pdf" and row["storage_path"]:
+            u = signed_url(BUCKET_PDF, row["storage_path"])
+            return f"[Télécharger]({u})" if u else ""
+        return ""
+
+    def src_link(row):
+        u = normalize_url(row["source_url"])
+        return f"[Source]({u})" if u else ""
+
+    if view_mode == "Cartes":
+        limit = st.session_state.adv_cards_shown
+        with st.spinner("Chargement des cartes…"):
+            df = fetch_posts_page(title_q, keyword_q, year, doc_types, cats, limit=limit, offset=0)
+
+        # grid of cards
+        cards_per_row = 3
+        rows = (len(df) + cards_per_row - 1) // cards_per_row
+        idx = 0
+        for _ in range(rows):
+            cols = st.columns(cards_per_row, gap="large")
+            for c in cols:
+                if idx >= len(df): break
+                row = df.iloc[idx]
+                idx += 1
+                with c:
+                    # cover
+                    if row.get("cover_path"):
+                        cu = signed_url(BUCKET_COVER, row["cover_path"])
+                        if cu: st.image(cu, use_column_width=True)
 
 
+                    st.markdown(f"**{row['title']}**")
+                    st.caption(f"ID: `{row['id']}`")
 
+                    meta = []
+                    if row.get("year"):   meta.append(str(row["year"]))
+                    if row.get("editor"): meta.append(row["editor"])
+                    if row.get("author"): meta.append(row["author"])
+                    if row.get("isbn"):   meta.append(f"ISBN: {row['isbn']}")
+                    if meta: st.caption(" • ".join(meta))
+
+                    if row.get("summary"):
+                        st.write((row["summary"][:220] + "…") if len(row["summary"])>220 else row["summary"])
+
+                    links = [x for x in (src_link(row), dl_link(row)) if x]
+                    if links:
+                        st.markdown(" | ".join(links))
+
+        if len(df) < total:
+            more = min(POSTS_STEP_CARDS, total - len(df))
+            if st.button(f"Charger plus ({more})"):
+                st.session_state.adv_cards_shown = min(st.session_state.adv_cards_shown + POSTS_STEP_CARDS, total)
+                st.rerun()
+
+    else:
+        limit = st.session_state.adv_table_shown
+        with st.spinner("Chargement du tableau…"):
+            df = fetch_posts_page(title_q, keyword_q, year, doc_types, cats, limit=limit, offset=0)
+
+        if not df.empty:
+            df["télécharger"] = df.apply(dl_link, axis=1)
+            df["source"] = df.apply(src_link, axis=1)
+            df = df[["id","title","year","editor","author","isbn","categories","source","télécharger","date","doc_type"]]
+            st.caption(f"Total: {total:,} | Affichés: {len(df):,}")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if len(df) < total:
+            more = min(POSTS_STEP_TABLE, total - len(df))
+            if st.button(f"Charger plus de lignes (+{more})"):
+                st.session_state.adv_table_shown = min(st.session_state.adv_table_shown + POSTS_STEP_TABLE, total)
+                st.rerun()
+
+# ===========================
+# ⬆️ UPLOAD TAB (Admin)
+# ===========================
 if tab_upload is not None:
     with tab_upload:
-        if not st.session_state["is_admin"]:
-            st.info("⬆️ L’upload est réservé aux administrateurs. Ouvrez l’onglet **Admin** pour vous connecter.")
-            st.stop()
-
+        require_admin()
         st.markdown("### Ajouter un document")
 
-        # ---- 1) Choose mode OUTSIDE any form (prevents widget reuse) ----
         MODE_HTML = "HTML (fichier / coller)"
         MODE_PDF  = "PDF (fichier)"
         kind = st.radio("Type de document", [MODE_HTML, MODE_PDF], index=0, horizontal=True, key="kind_radio_global")
 
-        # ---- 2) Common fields (we'll read them inside each form via session state) ----
         title   = st.text_input("Titre *", key="common_title")
         year    = st.number_input("Année (du document)", min_value=1800, max_value=2100, value=None, step=1,
                                   format="%d", key="common_year")
@@ -461,7 +411,7 @@ if tab_upload is not None:
         cover_file = st.file_uploader("Image de couverture (jpg/png)", type=["jpg","jpeg","png"], key="common_cover")
         cats_text = st.text_input("Catégories (séparées par des virgules)", key="common_cats")
 
-        # helper to upload cover now (so both forms can use it)
+        # Upload cover now (so both forms can use it)
         cover_path = None
         if cover_file is not None:
             cover_bytes = cover_file.read()
@@ -473,7 +423,6 @@ if tab_upload is not None:
 
         categories = [c.strip() for c in (cats_text or "").split(",") if c.strip()]
 
-        # ---- 3) Show exactly ONE form depending on 'kind' ----
         if kind == MODE_HTML:
             with st.form("form_html", clear_on_submit=True):
                 html_file = st.file_uploader("Fichier HTML", type=["html","htm"], key="html_uploader_unique")
@@ -488,7 +437,6 @@ if tab_upload is not None:
                 raw_html = (html_file.read().decode("utf-8", errors="replace") if html_file else html_paste)
                 text_content = clean_html_to_text(raw_html) if raw_html else ""
 
-                # auto fill title / year if missing
                 if not title:
                     auto = extract_title_from_html(raw_html)
                     if auto: title = auto
@@ -508,7 +456,7 @@ if tab_upload is not None:
                     editor=editor, summary=summary, author=author, isbn=isbn, year=year,
                     cover_path=cover_path, categories=categories
                 )
-                st.success("Document HTML enregistré ")
+                st.success("Document HTML enregistré ✅")
 
         elif kind == MODE_PDF:
             with st.form("form_pdf", clear_on_submit=True):
@@ -534,7 +482,6 @@ if tab_upload is not None:
                     except Exception:
                         text_content = ""
 
-                # auto title/year if missing
                 if not title:
                     if pdf_file:
                         base = pdf_file.name.rsplit(".", 1)[0]
@@ -561,7 +508,9 @@ if tab_upload is not None:
                 )
                 st.success("Document PDF enregistré ✅")
 
-
+# ===========================
+# 🔐 ADMIN TAB
+# ===========================
 with tab_admin:
     st.markdown("### Zone administrateur")
 
@@ -571,8 +520,6 @@ with tab_admin:
             st.session_state["is_admin"] = False
             st.rerun()
 
-
-        # Delete section
         st.markdown("#### Supprimer un document")
         del_id = st.number_input("ID du document à supprimer", min_value=1, step=1)
         if st.button("Supprimer définitivement"):
@@ -581,7 +528,6 @@ with tab_admin:
                 st.success(f"Document {int(del_id)} supprimé.")
             else:
                 st.error("Échec : ID introuvable.")
-
     else:
         pw = st.text_input("Mot de passe admin", type="password")
         if st.button("Se connecter"):
@@ -591,5 +537,3 @@ with tab_admin:
                 st.rerun()
             else:
                 st.error("Mot de passe incorrect.")
-
-
